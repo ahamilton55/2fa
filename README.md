@@ -1,7 +1,9 @@
 # 2fa-vault
 
 2fa-vault is a two-factor authentication agent with Hashicorp vault for storage. It allows
-you to share a OTP code to shared accounts with others in your organization.
+you to share a OTP code to shared accounts with others in your organization. You should probably check out the [TOTP backend](https://www.vaultproject.io/docs/secrets/totp/index.html) for fault that does this and more anyways.
+
+This was a project that interested me before I knew that Vault already handled this. You can use it or the TOTP backend for Vault.
 
 2fa-vault is based on 2fa by rsc (https://github.com/rsc/2fa)
 
