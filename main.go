@@ -2,15 +2,17 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// 2fa is a two-factor authentication agent.
+// 2fa-vault is a two-factor authentication agent using vault as a backend. It allows
+// you to share a OTP codes to shared accounts with others in your organization.
+// It is based on 2fa by rsc (https://github.com/rsc/2fa)
 //
 // Usage:
 //
-//	2fa -add [-7] [-8] [-hotp] name
-//	2fa -list
-//	2fa name
+//	2fa-vault -add [-7] [-8] [-hotp] name
+//	2fa-vault -list
+//	2fa-vault name
 //
-// “2fa -add name” adds a new key to the 2fa keychain with the given name.
+// “2fa-vault -add name” adds a new key to the 2fa-vault keychain with the given name.
 // It prints a prompt to standard error and reads a two-factor key from standard input.
 // Two-factor keys are short case-insensitive strings of letters A-Z and digits 2-7.
 //
@@ -20,19 +22,19 @@
 // By default the new key generates 6-digit codes; the -7 and -8 flags select
 // 7- and 8-digit codes instead.
 //
-// “2fa -list” lists the names of all the keys in the keychain.
+// “2fa-vault -list” lists the names of all the keys in the keychain.
 //
-// “2fa name” prints a two-factor authentication code from the key with the
+// “2fa-vault name” prints a two-factor authentication code from the key with the
 // given name.
 //
-// With no arguments, 2fa prints two-factor authentication codes from all
+// With no arguments, 2fa-vault prints two-factor authentication codes from all
 // known time-based keys.
 //
 // The default time-based authentication codes are derived from a hash of
 // the key and the current time, so it is important that the system clock have
 // at least one-minute accuracy.
 //
-// The keychain is stored unencrypted in the text file $HOME/.2fa.
+// The keychain is stored unencrypted in the text file $HOME/.2fa-vault.
 //
 // Example
 //
@@ -40,21 +42,21 @@
 // click the “enter this text code instead” link. A window pops up showing
 // “your two-factor secret,” a short string of letters and digits.
 //
-// Add it to 2fa under the name github, typing the secret at the prompt:
+// Add it to 2fa-vault under the name github, typing the secret at the prompt:
 //
-//	$ 2fa -add github
-//	2fa key for github: nzxxiidbebvwk6jb
+//	$ 2fa-vault -add github
+//	2fa-vault key for github: nzxxiidbebvwk6jb
 //	$
 //
-// Then whenever GitHub prompts for a 2FA code, run 2fa to obtain one:
+// Then whenever GitHub prompts for a 2FA code, run 2fa-vault to obtain one:
 //
-//	$ 2fa github
+//	$ 2fa-vault github
 //	268346
 //	$
 //
 // Or to type less:
 //
-//	$ 2fa
+//	$ 2fa-vault
 //	268346	github
 //	$
 //
@@ -62,22 +64,25 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base32"
 	"encoding/binary"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
+
+	vault "github.com/hashicorp/vault/api"
+)
+
+const (
+	vaultPath = "secret/2fa"
 )
 
 var (
@@ -102,7 +107,11 @@ func main() {
 	flag.Usage = usage
 	flag.Parse()
 
-	k := readKeychain(filepath.Join(os.Getenv("HOME"), ".2fa"))
+	p := os.Getenv("2FA_PATH")
+	if p == "" {
+		p = vaultPath
+	}
+	k := readKeychain(p)
 
 	if *flagList {
 		if flag.NArg() != 0 {
@@ -143,56 +152,62 @@ type Key struct {
 
 const counterLen = 20
 
-func readKeychain(file string) *Keychain {
+func getVaultLogical() (*vault.Logical, error) {
+	vClient, err := vault.NewClient(nil)
+	if err != nil {
+		return nil, err
+	}
+	return vClient.Logical(), nil
+}
+
+func readKeychain(path string) *Keychain {
 	c := &Keychain{
-		file: file,
+		file: path,
 		keys: make(map[string]Key),
 	}
-	data, err := ioutil.ReadFile(file)
+	l, err := getVaultLogical()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return c
-		}
-		log.Fatal(err)
+		log.Fatalf("unable to connect to vault: %v", err)
 	}
-	c.data = data
 
-	lines := bytes.SplitAfter(data, []byte("\n"))
-	offset := 0
-	for i, line := range lines {
-		lineno := i + 1
-		offset += len(line)
-		f := bytes.Split(bytes.TrimSuffix(line, []byte("\n")), []byte(" "))
-		if len(f) == 1 && len(f[0]) == 0 {
-			continue
-		}
-		if len(f) >= 3 && len(f[1]) == 1 && '6' <= f[1][0] && f[1][0] <= '8' {
-			var k Key
-			name := string(f[0])
-			k.digits = int(f[1][0] - '0')
-			raw, err := decodeKey(string(f[2]))
-			if err == nil {
-				k.raw = raw
-				if len(f) == 3 {
-					c.keys[name] = k
-					continue
-				}
-				if len(f) == 4 && len(f[3]) == counterLen {
-					_, err := strconv.ParseUint(string(f[3]), 10, 64)
-					if err == nil {
-						// Valid counter.
-						k.offset = offset - counterLen
-						if line[len(line)-1] == '\n' {
-							k.offset--
-						}
-						c.keys[name] = k
-						continue
+	secrets, err := l.List(path)
+	if err != nil || secrets == nil {
+		log.Fatalf("no secrets found for path %s: %v", path, err)
+	}
+
+	if keys, ok := secrets.Data["keys"]; ok {
+		var k Key
+		for _, n := range keys.([]interface{}) {
+			name := n.(string)
+			newPath := fmt.Sprintf("%s/%s", path, name)
+			s, err := l.Read(newPath)
+			if err != nil || s == nil {
+				continue
+			}
+			valid := true
+			for n, v := range s.Data {
+				if n == "size" {
+					d, err := strconv.Atoi(v.(string))
+					if err != nil {
+						valid = false
 					}
+					k.digits = d
+				} else if n == "text" {
+					raw, err := decodeKey(v.(string))
+					if err != nil {
+						valid = false
+					}
+					k.raw = raw
 				}
 			}
+			if valid {
+				c.keys[name] = k
+			}
 		}
-		log.Printf("%s:%d: malformed key", c.file, lineno)
+	} else {
+		log.Fatal("no 2fa keys found")
 	}
+
 	return c
 }
 
@@ -208,14 +223,14 @@ func (c *Keychain) list() {
 }
 
 func (c *Keychain) add(name string) {
-	size := 6
+	size := "6"
 	if *flag7 {
-		size = 7
+		size = "7"
 		if *flag8 {
 			log.Fatalf("cannot use -7 and -8 together")
 		}
 	} else if *flag8 {
-		size = 8
+		size = "8"
 	}
 
 	fmt.Fprintf(os.Stderr, "2fa key for %s: ", name)
@@ -228,23 +243,19 @@ func (c *Keychain) add(name string) {
 		log.Fatalf("invalid key: %v", err)
 	}
 
-	line := fmt.Sprintf("%s %d %s", name, size, text)
-	if *flagHotp {
-		line += " " + strings.Repeat("0", 20)
-	}
-	line += "\n"
-
-	f, err := os.OpenFile(c.file, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
+	l, err := getVaultLogical()
 	if err != nil {
-		log.Fatalf("opening keychain: %v", err)
+		log.Fatalf("unable to connect to vault: %v", err)
 	}
-	f.Chmod(0600)
+	vals := make(map[string]interface{})
+	vals["size"] = size
+	vals["text"] = text
 
-	if _, err := f.Write([]byte(line)); err != nil {
-		log.Fatal("adding key: %v", err)
-	}
-	if err := f.Close(); err != nil {
-		log.Fatal("adding key: %v", err)
+	path := fmt.Sprintf("%s/%s", c.file, name)
+
+	_, err = l.Write(path, vals)
+	if err != nil {
+		log.Fatalf("error writing values to vault: %v", err)
 	}
 }
 
